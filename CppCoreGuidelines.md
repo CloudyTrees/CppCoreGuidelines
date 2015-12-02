@@ -248,6 +248,13 @@ For a start, we have a few profiles corresponding to common needs (desires, idea
 The profiles are intended to be used by tools, but also serve as an aid to the human reader.
 We do not limit our comment in the **Enforcement** sections to things we know how to enforce; some comments are mere wishes that might inspire some tool builder.
 
+Tools that implement these rules shall respect the following syntax to explicitly suppress a rule:
+
+    [[suppress(tag)]]
+    
+where "tag" is the anchor name of the item where the Enrocement rule appears (e.g., for C.134 it is "Rh-public"), or the name of a profile group-of-rules ("types", "bounds", or "lifetime").
+
+
 ## <a name="SS-struct"></a> In.struct: The structure of this document
 
 Each rule (guideline, suggestion) can have several parts:
@@ -609,6 +616,8 @@ Also, it is implicit that `f2()` is supposed to `delete` its argument (or did th
 The standard library resource management pointers fail to pass the size when they point to an object:
 
     extern void f3(unique_ptr<int[]>, int n);    // separately compiled, possibly dynamically loaded
+                                                 // NB: this assumes the calling code is ABI-compatible, using a
+                                                 // compatible C++ compiler and the same stdlib implementation
 
     void g3(int n)
     {
@@ -620,7 +629,9 @@ The standard library resource management pointers fail to pass the size when the
 We need to pass the pointer and the number of elements as an integral object:
 
     extern void f4(vector<int>&);       // separately compiled, possibly dynamically loaded
-    extern void f4(span<int>);    // separately compiled, possibly dynamically loaded
+    extern void f4(span<int>);          // separately compiled, possibly dynamically loaded
+                                                 // NB: this assumes the calling code is ABI-compatible, using a
+                                                 // compatible C++ compiler and the same stdlib implementation
 
     void g3(int n)
     {
@@ -2198,6 +2209,8 @@ There are a variety of ways to pass parameters to a function and to return value
 Using "unusual and clever" techniques causes surprises, slows understanding by other programmers, and encourages bugs.
 If you really feel the need for an optimization beyond the common techniques, measure to ensure that it really is an improvement, and document/comment because the improvement may not be portable.
 
+The following tables summarize the advice in the following Guidelines, F.16-21.
+
 ![Normal parameter passing table](./param-passing-normal.png "Normal parameter passing")
 
 ![Advanced parameter passing table](./param-passing-advanced.png "Advanced parameter passing")
@@ -2225,9 +2238,9 @@ When copying is cheap, nothing beats the simplicity and safety of copying, and f
 
 For advanced uses (only), where you really need to optimize for rvalues passed to "input-only" parameters:
 
-* If the function is going to unconditionally move from the argument, take it by `&&`.
-* If the function is going to keep a copy of the argument, in addition to passing by `const&` add an overload that passes the parameter by `&&` and in the body `std::move`s it to its destination.
-* In special cases, such as multiple "input + copy" parameters, consider using perfect forwarding.
+* If the function is going to unconditionally move from the argument, take it by `&&`. See [F.21](#Rf-consume).
+* If the function is going to keep a copy of the argument, in addition to passing by `const&` add an overload that passes the parameter by `&&` and in the body `std::move`s it to its destination. Essentially this overloads a "consume"; see [F.21](#Rf-consume).
+* In special cases, such as multiple "input + copy" parameters, consider using perfect forwarding. See [F.19](#Rf-forward).
 
 ##### Example
 
@@ -2269,6 +2282,7 @@ If you need the notion of an optional value, use a pointer, `std::optional`, or 
 * (Simple) ((Foundation)) Warn when a parameter being passed by value has a size greater than `4 * sizeof(int)`.
   Suggest using a `const` reference instead.
 * (Simple) ((Foundation)) Warn when a `const` parameter being passed by reference has a size less than `3 * sizeof(int)`. Suggest passing by value instead.
+* (Simple) ((Foundation)) Warn when a `const` parameter being passed by reference is `move`d.
 
 
 ### <a name="Rf-inout"></a> Rule F.17: For "in-out" parameters, pass by reference to non-`const`
@@ -2303,11 +2317,18 @@ If the writer of `g()` makes an assumption about the size of `buffer` a bad logi
 
 ##### Enforcement
 * (Moderate) ((Foundation)) Warn about functions with non-`const` reference arguments that do *not* write to them.
+* (Simple) ((Foundation)) Warn when a non-`const` parameter being passed by reference is `move`d.
 
 
 ### <a name="Rf-consume"></a> Rule F.18: For "consume" parameters, pass by `X&&` and `std::move` the parameter
 
 ##### Reason
+
+It's efficient and eliminates bugs at the call site: `X&&` binds to rvalues, which requires an explicit `std::move` at the call site if passing an lvalue.
+
+##### Exception
+
+Unique owner types that are move-only and cheap-to-move, such as `unique_ptr`, can also be passed by value which is simpler to write and achieves the same effect. Passing by value  does generate one extra (cheap) move operation, but prefer simplicity and clarity first.
 
 ##### Enforcement
 * Flag all `X&&` parameters (where `X` is not a template type parameter name) where the function body uses them without `std::move`.
@@ -2326,13 +2347,13 @@ In that case, and only that case, make the parameter `TP&&` where `TP` is a temp
 ##### Example
 
     template <class F, class... Args>
-    inline auto invoke(F&& f, Args&&... args) {
-        return forward<F>(f)(forward<Args>(args)...);
+    inline auto invoke(F f, Args&&... args) {
+        return f(forward<Args>(args)...);
     }
- 
+
 
 ##### Enforcement
-* Flag a function that takes a `TP&&` parameter (where `TP` is a template type parameter name) and uses it without `std::forward`.
+* Flag a function that takes a `TP&&` parameter (where `TP` is a template type parameter name) and does anything with it other than `std::forward`ing it exactly once on every static path.
 
 
 ### <a name="Rf-out"></a> Rule F.20: For "out" output values, prefer return values to output parameters
@@ -2341,7 +2362,7 @@ In that case, and only that case, make the parameter `TP&&` where `TP` is a temp
 
 A return value is self-documenting, whereas a `&` could be either in-out or out-only and is liable to be misused.
 
-This includes large objects like standard containers that use implicit move operations for performance and to avoid explicit memory management. 
+This includes large objects like standard containers that use implicit move operations for performance and to avoid explicit memory management.
 
 If you have multiple values to return, [use a tuple](#Rf-out-multi) or similar multi-member type.
 
@@ -3687,13 +3708,18 @@ Also, that may affect ABIs.
 * A class with a reference data member is suspect.
 * A class with an `owner<T>` reference should define its default operations.
 
-### <a name="Rc-dtor-virtual"></a> C.35: A base class with a virtual function needs a virtual destructor
+### <a name="Rc-dtor-virtual"></a> C.35: A base class destructor should be either public and virtual, or protected and nonvirtual
 
 ##### Reason
 
 To prevent undefined behavior.
-If an application attempts to delete a derived class object through a base class pointer, the result is undefined if the base class's destructor is non-virtual.
+If the destructor is public, then calling code can attempt to destroy a derived class object through a base class pointer, and the result is undefined if the base class's destructor is non-virtual.
+If the destructor is protected, then calling code cannot destroy through a base class pointer and the destructor does not need to be virtual; it does need to be protected, not private, so that derived destructors can invoke it.
 In general, the writer of a base class does not know the appropriate action to be done upon destruction.
+
+##### Discussion
+
+See [this in the Discussion section](#Sd-dtor).
 
 ##### Example, bad
 
@@ -3716,11 +3742,11 @@ In general, the writer of a base class does not know the appropriate action to b
 ##### Note
 
 A virtual function defines an interface to derived classes that can be used without looking at the derived classes.
-Someone using such an interface is likely to also destroy using that interface.
+If the interface allows destroying, it should be safe to do so.
 
 ##### Note
 
-A destructor must be `public` or it will prevent stack allocation and normal heap allocation via smart pointer (or in legacy code explicit `delete`):
+A destructor must be nonprivate or it will prevent using the type :
 
     class X {
         ~X();	// private destructor
@@ -3733,9 +3759,14 @@ A destructor must be `public` or it will prevent stack allocation and normal hea
         auto p = make_unique<X>();  // error: cannot destroy
     }
 
+##### Exception
+
+We can imagine one case where you could want a protected virtual destructor: When an object of a derived type (and only of such a type) should be allowed to destroy *another* object (not itself) through a pointer to base. We haven't seen such a case in practice, though.
+
 ##### Enforcement
 
-(Simple) A class with any virtual functions should have a virtual destructor.
+* A class with any virtual functions should have a destructor that is either public and virtual or else protected and nonvirtual.
+
 
 ### <a name="Rc-dtor-fail"></a> C.36: A destructor may not fail
 
@@ -5164,6 +5195,7 @@ Summary of container rules:
 
 A function object is an object supplying an overloaded `()` so that you can call it.
 A lambda expression (colloquially often shortened to "a lambda") is a notation for generating a function object.
+Function objects should be cheap to copy (and therefore [passed by value](#Rf-in)).
 
 Summary:
 
@@ -5195,7 +5227,7 @@ Designing rules for classes in a hierarchy summary:
 * [C.131: Avoid trivial getters and setters](#Rh-get)
 * [C.132: Don't make a function `virtual` without reason](#Rh-virtual)
 * [C.133: Avoid `protected` data](#Rh-protected)
-* [C.134: Ensure all data members have the same access level](#Rh-public)
+* [C.134: Ensure all non-`const` data members have the same access level](#Rh-public)
 * [C.135: Use multiple inheritance to represent multiple distinct interfaces](#Rh-mi-interface)
 * [C.136: Use multiple inheritance to represent the union of implementation attributes](#Rh-mi-implementation)
 * [C.137: Use `virtual` bases to avoid overly general base classes](#Rh-vbase)
@@ -5487,36 +5519,41 @@ Protected member function can be just fine.
 
 Flag classes with `protected` data.
 
-### <a name="Rh-public"></a> C.134: Ensure all data members have the same access level
+### <a name="Rh-public"></a> C.134: Ensure all non-`const` data members have the same access level
 
 ##### Reason
 
 Prevention of logical confusion leading to errors.
-If the data members don't have the same access level, the type is confused about what it's trying to do.
-Is it a type that maintains an invariant os simply a collection of values?
+If the non-`const` data members don't have the same access level, the type is confused about what it's trying to do.
+Is it a type that maintains an invariant or simply a collection of values?
 
-##### Note
+##### Discussion
 
-This leaves us with three alternatives:
+The core question is: What code is responsible for maintaining a meaningful/correct value for that variable?
 
-* *All public*: If you're writing an aggregate bundle-of-variables without an invariant across those variables, then all the variables should be public.
-[Declare such classes `struct` rather than `class`](#Rc-struct)
-* *All protected*: [Avoid `protected` data](#Rh-protected).
-* *All private*: If you’re writing a type that maintains an invariant, then all the variables should be private – it should be encapsulated.
-  This is the vast majority of classes.
+There are exactly two kinds of data members:
 
-##### Note
+* A: Ones that don’t participate in the object’s invariant. Any combination of values for these members is valid.
+* B: Ones that do participate in the object’s invariant. Not every combination of values is meaningful (else there’d be no invariant). Therefore all code that has write access to these variables must know about the invariant, know the semantics, and know (and actively implement and enforce) the rules for keeping the values correct.
 
-There are undoubtedly examples where a mixture of access levels for data is tempting.
-We have been unable to think of realistic cases that makes it worthwhile to weaken the simple rule.
+Data members in category A should just be `public` (or, more rarely, `protected` if you only want derived classes to see them). They don’t need encapsulation. All code in the system might as well see and manipulate them.
 
-##### Example
+Data members in category B should be `private` or `const`. This is because encapsulation is important. To make them non-`private` and non-`const` would mean that the object can't control its own state: An unbounded amount of code beyond the class would need to know about the invariant and participate in maintaining it accurately -- if these data members were `public`, that would be all calling code that uses the object; if they were `protected`, it would be all the code in current and future derived classes. This leads to brittle and tightly coupled code that quickly becomes a nightmare to maintain. Any code that inadvertently sets the data members to an invalid or unexpected combination of values would corrupt the object and all subsequent uses of the object.
 
-    ???
+Most classes are either all A or all B:
+
+* *All public*: If you're writing an aggregate bundle-of-variables without an invariant across those variables, then all the variables should be `public`.
+[By convention, declare such classes `struct` rather than `class`](#Rc-struct)
+* *All private*: If you’re writing a type that maintains an invariant, then all the non-`const` variables should be private -- it should be encapsulated.
+
+##### Exceptions
+
+Occasionally classes will mix A and B, usually for debug reasons. An encapsulated object may contain something like non-`const` debug instrumentation that isn’t part of the invariant and so falls into category A -- it isn’t really part of the object’s value or meaningful observable state either. In that case, the A parts should be treated as A's (made `public`, or in rarer cases `protected` if they should be visible only to derived classes) and the B parts should still be treated like B’s (`private` or `const`).
 
 ##### Enforcement
 
-Flag any class that has data members with different access levels.
+Flag any class that has non-`const` data members with different access levels.
+
 
 ### <a name="Rh-mi-interface"></a> C.135: Use multiple inheritance to represent multiple distinct interfaces
 
@@ -5841,12 +5878,26 @@ Avoid resource leaks.
 ##### Reason
 
  `make_unique` gives a more concise statement of the construction.
+It also ensures exception safety in complex expressions.
 
 ##### Example
 
     unique_ptr<Foo> p {new<Foo>{7}};	// OK: but repetitive
 
     auto q = make_unique<Foo>(7);		// Better: no repetition of Foo
+
+    // Not exception-safe: the compiler may interleave the computations of arguments as follows:
+    //
+    // 1. allocate memory for Foo,
+    // 2. construct Foo,
+    // 3. call bar,
+    // 4. construct unique_ptr<Foo>.
+    //
+    // If bar throws, Foo will not be destroyed, and the memory allocated for it will leak.
+    f(unique_ptr<Foo>(new Foo()), bar());
+
+    // Exception-safe: calls to functions are never interleaved.
+    f(make_unique<Foo>(), bar());
 
 ##### Enforcement
 
@@ -6252,7 +6303,7 @@ Instead use an `enum class`:
     void PrintColor(int color);
 
     enum class Webcolor { red=0xFF0000, green=0x00FF00, blue=0x0000FF };
-    enum class Productinfo { Red=0, Purple=1, Blue=2 };
+    enum class Productinfo { red=0, purple=1, blue=2 };
 
     Webcolor webby = Webcolor::blue;
     PrintColor(webby);  // Error: cannot convert Webcolor to int.
@@ -6522,7 +6573,7 @@ Returning a (raw) pointer imposes a life-time management uncertainty on the call
         delete p;
     }
 
-In addition to suffering from the problem from [leak](#???), this adds a spurious allocation and deallocation operation, and is needlessly verbose. If Gadget is cheap to move out of a function (i.e., is small or has an efficient move operation), just return it "by value":
+In addition to suffering from the problem from [leak](#???), this adds a spurious allocation and deallocation operation, and is needlessly verbose. If Gadget is cheap to move out of a function (i.e., is small or has an efficient move operation), just return it "by value" (see ["out" return values](#Rf-out)):
 
     Gadget make_gadget(int n)
     {
@@ -9062,18 +9113,18 @@ Simple code can be very fast. Optimizers sometimes do marvels with simple code
 ##### Example, good
 
     // clear expression of intent, fast execution
-    
+
     vector<uint8_t> v(100000);
-    
+
     for(auto& c : v)
         c = ~c;
 
 ##### Example, bad
 
     // intended to be faster, but is actually slower
-    
+
     vector<uint8_t> v(100000);
-    
+
     for(size_t i=0; i<v.size(); i+=sizeof(uint64_t))
     {
         uint64_t& quad_word = *reinterpret_cast<uint64_t*>(&v[i]);
@@ -12442,7 +12493,7 @@ Note: Declaring a `...` parameter is sometimes useful for techniques that don't 
 ##### Enforcement
 
 * Issue a diagnostic for using `va_list`, `va_start`, or `va_arg`. To fix: Use a variadic template parameter list instead.
-* Issue a diagnostic for passing an argument to a vararg parameter. To fix: Use a different function, or `[[suppress(types)]]`.
+* Issue a diagnostic for passing an argument to a vararg parameter of a function that does not offer an overload for a more specific type in the position of the vararg. To fix: Use a different function, or `[[suppress(types)]]`.
 
 ## <a name="SS-bounds"></a> Bounds safety profile
 
@@ -12641,17 +12692,23 @@ These functions all have bounds-safe overloads that take `span`. Standard types 
     void f()
     {
         array<int, 10> a, b;
-        memset(a.data(), 0, 10); 		// BAD, and contains a length error
-        memcmp(a.data(), b.data(), 10); // BAD, and contains a length error
+        memset(a.data(), 0, 10); 		// BAD, and contains a length error (length = 10 * sizeof(int))
+        memcmp(a.data(), b.data(), 10); // BAD, and contains a length error (length = 10 * sizeof(int))
     }
+
+Also, `std::array<>::fill()` or `std::fill()` or even an empty initializer are better candidate than `memset()`.
 
 ##### Example, good
 
     void f()
     {
-        array<int, 10> a, b;
-        memset(a, 0); 	// OK
-        memcmp({a, b}); 	// OK
+        array<int, 10> a, b, c{};       // c is initialized to zero
+        a.fill(0);
+        fill(b.begin(), b.end(), 0);    // std::fill()
+        fill(b, 0);                     // std::fill() + Ranges TS
+
+        if ( a == b ) {
+        }
     }
 
 ##### Example
@@ -12802,6 +12859,11 @@ The notation is that of the ISO WG21 Concepts TS (???ref???).
 * `Predicate`
 * `Relation`
 * ...
+
+### <a name="SS-gsl-smartptrconcepts"></a> Smart pointer concepts
+
+Described in [Lifetimes paper](https://github.com/isocpp/CppCoreGuidelines/blob/master/docs/Lifetimes%20I%20and%20II%20-%20v0.9.1.pdf).
+
 
 # <a name="S-naming"></a> NL: Naming and layout rules
 
@@ -13422,9 +13484,19 @@ Here is an example of the last option:
             return p;
         }
     };
+    
+    
+    class D : public B {                 // some derived class
+    public:
+        void f() override { /* ...  */ };
 
-    class D : public B { /* "¦ */ };     // some derived class
+    protected:
+        D() {}
 
+        template<class T>
+        friend shared_ptr<T> B::Create();
+    };    
+    
     shared_ptr<D> p = D::Create<D>();    // creating a D object
 
 This design requires the following discipline:
